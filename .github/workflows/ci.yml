@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      MIX_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to a widely-available OTP/Elixir pair. Bump to match your local
+      # toolchain (currently Elixir 1.20 / OTP 29) once the runners offer it.
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27.2"
+          elixir-version: "1.18.3"
+
+      - name: Cache deps and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-${{ hashFiles('**/mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Check unused deps
+        run: mix deps.unlock --check-unused
+
+      - name: Check formatting
+        run: mix format --check-formatted
+
+      - name: Credo (strict)
+        run: mix credo --strict
+
+      - name: Run specs
+        run: mix test
+
+  # C17 end-to-end: drive the real server (prod release) and the real CLI
+  # (Burrito binary) through the full product scenario. The scenario IS the
+  # test (test/e2e/scenario.sh); any failed assertion fails the job. Runs only
+  # after the unit build/specs pass. See .agents/c17_e2e_plan.md.
+  e2e:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27.2"
+          elixir-version: "1.18.3"
+
+      # zig + xz/7zip are Burrito's build toolchain (D22). Pin zig — Burrito is
+      # version-sensitive. jq drives the JSON assertions in the scenario.
+      - name: Install Burrito build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xz-utils p7zip-full jq
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.14.0"
+
+      - name: Cache deps and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+            cli/deps
+            cli/_build
+          key: ${{ runner.os }}-e2e-${{ hashFiles('**/mix.lock') }}
+          restore-keys: ${{ runner.os }}-e2e-
+
+      - name: Fetch server + CLI deps
+        run: |
+          mix deps.get
+          (cd cli && mix deps.get)
+
+      # Build only the host target (linux_x86) to keep the Burrito step fast;
+      # all four targets + publishing are C18's release job.
+      - name: Build CLI binary (Burrito, host target)
+        run: cd cli && BURRITO_TARGET=linux_x86 MIX_ENV=prod mix release
+
+      - name: Run end-to-end scenario
+        run: |
+          EXWEAVER_CLI="$(ls "$PWD"/cli/burrito_out/exweaver_linux_x86 \
+            || ls "$PWD"/cli/burrito_out/*linux*x86* | head -1)"
+          export EXWEAVER_CLI
+          echo "Driving CLI binary: $EXWEAVER_CLI"
+          bash test/e2e/scenario.sh

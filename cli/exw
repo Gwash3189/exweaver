@@ -1,0 +1,1 @@
+MIX_ENV=dev mix run --no-compile -e 'ExweaverCli.CLI.main(System.argv())' -- "$@"
